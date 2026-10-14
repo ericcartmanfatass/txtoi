@@ -123,7 +123,12 @@ private data class RuleDragCallbacks(
 private enum class RestoreAction { HIDDEN, ORDER }
 
 @Composable
-internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit, onBuiltin: () -> Unit) {
+internal fun RuleScreen(
+    activity: MainActivity,
+    onAbout: () -> Unit,
+    onBuiltin: () -> Unit,
+    systemHookReady: Boolean,
+) {
     val editor = remember(activity) { ViewModelProvider(activity)[RuleEditorViewModel::class.java] }
     val saveState by editor.state.collectAsState()
     val emptySnapshot = remember { SystemRuleStore.Snapshot.empty() }
@@ -341,6 +346,14 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit, onBuiltin: 
                 IconButton(onClick = onAbout, enabled = canUseActions) {
                     Image(painterResource(R.drawable.ic_info), "关于", modifier = Modifier.size(24.dp))
                 }
+            }
+            if (!systemHookReady) {
+                Text(
+                    "系统查询 Hook 未通过检测；扩展项修改可能不会生效。可以先测试右上角的系统操作。",
+                    modifier = Modifier.padding(top = 4.dp),
+                    fontSize = 12.sp,
+                    color = Color(0xFFB36B15),
+                )
             }
             Text("扩展项：勾选隐藏 · 拖动排序 · 自动保存", modifier = Modifier.padding(top = 4.dp),
                 fontSize = 13.sp, color = MiuixTheme.colorScheme.onBackgroundVariant)

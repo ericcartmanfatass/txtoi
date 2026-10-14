@@ -38,38 +38,69 @@ public final class SelectionMenuModule extends XposedModule {
     private static volatile boolean appTextHookInstalled;
     private static volatile int cachedBuiltinMask;
     private static volatile long builtinNextRefreshAt;
+    private static int recordedQueryHits;
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
-        if (param.isSystemServer()) {
-            log(android.util.Log.INFO, "SelectionMenuControl", "Modern module loaded in system_server; waiting for system class loader");
-        }
+        log(android.util.Log.INFO, "SelectionMenuControl",
+                "Module loaded: systemServer=" + param.isSystemServer());
     }
 
     @Override
     public void onSystemServerStarting(XposedModuleInterface.SystemServerStartingParam param) {
+        ClassLoader loader = param.getClassLoader();
+        int internalHooks = 0;
         if (isXiaomiRom()) {
             try {
-                installHyperOsQueryHook(param.getClassLoader());
-                return;
+                internalHooks = installHyperOsQueryHooks(loader);
             } catch (Throwable error) {
                 log(android.util.Log.WARN, "SelectionMenuControl",
-                        "HyperOS PM hook unavailable; trying public query boundary", error);
+                        "HyperOS ComputerEngine hook scan failed; trying public query boundary", error);
             }
         }
+
+        // Install the public boundary independently. A ROM can bypass the intercepted
+        // internal overload even when it exists, causing the previous version to appear
+        // enabled but never reach the menu query.
+        boolean publicHook = false;
         try {
-            ClassLoader classLoader = param.getClassLoader();
             Class<?> packageManager = Class.forName(
-                    "com.android.server.pm.IPackageManagerBase", false, classLoader);
-            Method query = packageManager.getDeclaredMethod("queryIntentActivities",
-                    Intent.class, String.class, long.class, int.class);
-            Class<?> sliceClass = Class.forName("android.content.pm.ParceledListSlice", false, classLoader);
-            Method getList = sliceClass.getMethod("getList");
-            Constructor<?> newSlice = sliceClass.getConstructor(List.class);
-            hook(query).intercept(chain -> interceptPublicProcessTextQuery(chain, sliceClass, getList, newSlice));
-            log(android.util.Log.INFO, "SelectionMenuControl", "Hooked public PROCESS_TEXT queryIntentActivities boundary");
+                    "com.android.server.pm.IPackageManagerBase", false, loader);
+            for (Method query : packageManager.getDeclaredMethods()) {
+                Class<?>[] types = query.getParameterTypes();
+                if (!"queryIntentActivities".equals(query.getName())
+                        || types.length != 4
+                        || types[0] != Intent.class
+                        || types[1] != String.class
+                        || types[2] != long.class
+                        || types[3] != int.class) continue;
+                Class<?> sliceClass = Class.forName("android.content.pm.ParceledListSlice", false, loader);
+                Method getList = sliceClass.getMethod("getList");
+                Constructor<?> newSlice = sliceClass.getConstructor(List.class);
+                hook(query).intercept(chain -> interceptPublicProcessTextQuery(chain,
+                        sliceClass, getList, newSlice));
+                publicHook = true;
+                break;
+            }
         } catch (Throwable error) {
-            log(android.util.Log.ERROR, "SelectionMenuControl", "Public PROCESS_TEXT menu query hook not installed", error);
+            log(android.util.Log.WARN, "SelectionMenuControl",
+                    "Public PROCESS_TEXT query boundary unavailable", error);
+        }
+        log(android.util.Log.INFO, "SelectionMenuControl",
+                "System server Hook install complete: internal=" + internalHooks
+                        + ", public=" + publicHook + ", manufacturer=" + Build.MANUFACTURER);
+        if (internalHooks == 0 && !publicHook) {
+            log(android.util.Log.ERROR, "SelectionMenuControl",
+                    "No PROCESS_TEXT query hook installed; module will not affect menus");
+        }
+    }
+
+    private static synchronized void recordQueryHit(String source, int originalCount) {
+        if (recordedQueryHits < 8) {
+            recordedQueryHits++;
+            android.util.Log.i("SelectionMenuControl", "PROCESS_TEXT query hit: source="
+                    + source + ", candidates=" + originalCount
+                    + ", hit=" + recordedQueryHits);
         }
     }
 
@@ -79,25 +110,52 @@ public final class SelectionMenuModule extends XposedModule {
                 || maker.equalsIgnoreCase("Redmi") || maker.equalsIgnoreCase("POCO"));
     }
 
-    private void installHyperOsQueryHook(ClassLoader loader) throws ReflectiveOperationException {
+    private int installHyperOsQueryHooks(ClassLoader loader) throws ReflectiveOperationException {
         Class<?> engine = Class.forName("com.android.server.pm.ComputerEngine", false, loader);
-        Method query = engine.getDeclaredMethod("queryIntentActivitiesInternal",
-                Intent.class, String.class, long.class, long.class,
-                int.class, int.class, int.class, boolean.class, boolean.class);
-        hook(query).intercept(this::interceptHyperOsQuery);
-        log(android.util.Log.INFO, "SelectionMenuControl",
-                "HyperOS PROCESS_TEXT ComputerEngine hook installed");
+        int installed = 0;
+        for (Method method : engine.getDeclaredMethods()) {
+            Class<?>[] types = method.getParameterTypes();
+            if (!"queryIntentActivitiesInternal".equals(method.getName())
+                    || types.length < 4
+                    || types[0] != Intent.class
+                    || !List.class.isAssignableFrom(method.getReturnType())) continue;
+            if (java.lang.reflect.Modifier.isAbstract(method.getModifiers())
+                    || java.lang.reflect.Modifier.isStatic(method.getModifiers())) continue;
+
+            int startFlagIndex = -1;
+            if (types.length >= 2 && types[types.length - 2] == boolean.class
+                    && types[types.length - 1] == boolean.class) {
+                startFlagIndex = types.length - 2;
+            }
+            final int effectiveStartFlagIndex = startFlagIndex;
+            try {
+                hook(method).intercept(chain ->
+                        interceptHyperOsQuery(chain, effectiveStartFlagIndex));
+                installed++;
+                log(android.util.Log.INFO, "SelectionMenuControl",
+                        "Hooked HyperOS ComputerEngine overload: " + method.toGenericString());
+            } catch (Throwable hookFailure) {
+                log(android.util.Log.WARN, "SelectionMenuControl",
+                        "Could not hook ComputerEngine overload " + method.toGenericString(), hookFailure);
+            }
+        }
+        if (installed == 0) {
+            throw new ReflectiveOperationException("No compatible ComputerEngine query overload hooked");
+        }
+        return installed;
     }
 
-    private Object interceptHyperOsQuery(XposedInterface.Chain chain) throws Throwable {
+    private Object interceptHyperOsQuery(XposedInterface.Chain chain, int startFlagIndex) throws Throwable {
         Object result = chain.proceed();
         List<Object> args = chain.getArgs();
-        if (args.size() != 9 || !(args.get(0) instanceof Intent)
+        if (args.isEmpty() || !(args.get(0) instanceof Intent)
                 || !(result instanceof List<?>)) return result;
         Intent intent = (Intent) args.get(0);
         if (!Intent.ACTION_PROCESS_TEXT.equals(intent.getAction())
                 || intent.getComponent() != null || intent.getPackage() != null
-                || Boolean.TRUE.equals(args.get(7))) return result;
+                || (startFlagIndex >= 0 && Boolean.TRUE.equals(args.get(startFlagIndex))))
+            return result;
+        recordQueryHit("ComputerEngine", ((List<?>) result).size());
 
         boolean originalQuery = isOriginalQuery(intent);
         SystemRuleStore.Snapshot rules = readRules();
@@ -151,6 +209,8 @@ public final class SelectionMenuModule extends XposedModule {
         if (!isXiaomiRom() || !param.isFirstPackage()
                 || BuildConfig.APPLICATION_ID.equals(param.getPackageName())
                 || appTextHookInstalled) return;
+        log(android.util.Log.INFO, "SelectionMenuControl",
+                "Attempting built-in menu hook for " + param.getPackageName());
         try {
             Class<?> callback = Class.forName("android.widget.Editor$TextActionModeCallback",
                     false, param.getDefaultClassLoader());
@@ -192,10 +252,19 @@ public final class SelectionMenuModule extends XposedModule {
                 Class<?> thread = Class.forName("android.app.ActivityThread");
                 Object application = thread.getMethod("currentApplication").invoke(null);
                 if (application instanceof Context) {
-                    cachedBuiltinMask = BuiltinRuleStore.read((Context) application);
+                    int updated = BuiltinRuleStore.read((Context) application);
+                    if (updated != cachedBuiltinMask) {
+                        cachedBuiltinMask = updated;
+                        android.util.Log.i("SelectionMenuControl",
+                                "Built-in menu rules loaded: mask=" + updated);
+                    }
+                } else {
+                    android.util.Log.w("SelectionMenuControl",
+                            "Application context not ready for built-in menu settings");
                 }
-            } catch (Throwable ignored) {
-                // Keep the default of no hidden actions when settings are unavailable.
+            } catch (Throwable error) {
+                android.util.Log.w("SelectionMenuControl",
+                        "Could not read built-in menu settings; using cached rules", error);
             }
             builtinNextRefreshAt = now + 2500L;
             return cachedBuiltinMask;
@@ -224,6 +293,7 @@ public final class SelectionMenuModule extends XposedModule {
         if (!processText || !sliceClass.isInstance(result)) {
             return result;
         }
+        recordQueryHit("IPackageManagerBase", -1);
         boolean originalQuery = isOriginalQuery(intent);
         SystemRuleStore.Snapshot rules = readRules();
         if (!originalQuery && (!rules.valid || (rules.hiddenComponents.isEmpty() && rules.orderedComponents.isEmpty()))) {
@@ -248,13 +318,17 @@ public final class SelectionMenuModule extends XposedModule {
                 long identity = Binder.clearCallingIdentity();
                 try {
                     Context context = getSystemContext();
-                    SystemMenuClassifier classifier = getMenuClassifier();
-                    if (classifier != null) {
-                        SystemMenuClassifier.Result policy = classifier.evaluate(context, resolved, originalQuery);
+                    if (isXiaomiRom()) {
+                        SystemMenuClassifier.Result policy = HyperOsMenuClassifier.evaluate(resolved);
                         classifications = policy.classifications;
-                        // Only the module UI receives the system toolbar's display order.
-                        // Host queries retain their PM slots before applying ordinary rules.
                         if (originalQuery) resolved = policy.displayOrder;
+                    } else {
+                        SystemMenuClassifier classifier = getMenuClassifier();
+                        if (classifier != null) {
+                            SystemMenuClassifier.Result policy = classifier.evaluate(context, resolved, originalQuery);
+                            classifications = policy.classifications;
+                            if (originalQuery) resolved = policy.displayOrder;
+                        }
                     }
                 } finally {
                     Binder.restoreCallingIdentity(identity);

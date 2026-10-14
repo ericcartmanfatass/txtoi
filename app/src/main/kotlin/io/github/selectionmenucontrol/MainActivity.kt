@@ -177,7 +177,7 @@ private fun ModuleApp(activity: MainActivity) {
         }
     }
 
-    if (gateState.checking || !gateState.systemHookReady || !gateState.rootReady) {
+    if (gateState.checking || !gateState.rootReady) {
         EnvironmentGate(gateState) { refreshSignal++ }
     } else {
         BackHandler(enabled = showAbout || showBuiltin) {
@@ -202,7 +202,8 @@ private fun ModuleApp(activity: MainActivity) {
             }
             else if (screen == 2) BuiltinMenuScreen(activity) { showBuiltin = false }
             else RuleScreen(activity, onAbout = { showAbout = true },
-                onBuiltin = { showBuiltin = true })
+                onBuiltin = { showBuiltin = true },
+                systemHookReady = gateState.systemHookReady)
         }
     }
 
