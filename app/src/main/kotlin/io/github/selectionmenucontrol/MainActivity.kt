@@ -143,6 +143,7 @@ private fun ModuleApp(activity: MainActivity) {
     var gateState by remember { mutableStateOf(GateState()) }
     var refreshSignal by remember { mutableIntStateOf(0) }
     var showAbout by remember { mutableStateOf(false) }
+    var showBuiltin by remember { mutableStateOf(false) }
     var availableUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
     var autoCheckEnabled by remember { mutableStateOf(UpdateSettings.isAutoCheckEnabled(activity)) }
     val autoCheckOnLaunch = remember { autoCheckEnabled }
@@ -179,15 +180,16 @@ private fun ModuleApp(activity: MainActivity) {
     if (gateState.checking || !gateState.systemHookReady || !gateState.rootReady) {
         EnvironmentGate(gateState) { refreshSignal++ }
     } else {
-        BackHandler(enabled = showAbout) {
+        BackHandler(enabled = showAbout || showBuiltin) {
             showAbout = false
+            showBuiltin = false
         }
         Crossfade(
-            targetState = showAbout,
+            targetState = if (showAbout) 1 else if (showBuiltin) 2 else 0,
             animationSpec = tween(durationMillis = 220),
             label = "page-transition",
-        ) { aboutVisible ->
-            if (aboutVisible) {
+        ) { screen ->
+            if (screen == 1) {
                 AboutScreen(
                     activity = activity,
                     onBack = { showAbout = false },
@@ -198,7 +200,9 @@ private fun ModuleApp(activity: MainActivity) {
                     },
                 )
             }
-            else RuleScreen(activity) { showAbout = true }
+            else if (screen == 2) BuiltinMenuScreen(activity) { showBuiltin = false }
+            else RuleScreen(activity, onAbout = { showAbout = true },
+                onBuiltin = { showBuiltin = true })
         }
     }
 

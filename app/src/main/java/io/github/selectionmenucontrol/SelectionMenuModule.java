@@ -8,7 +8,10 @@ import android.content.pm.ActivityInfo;
 import android.content.pm.ResolveInfo;
 import android.os.Binder;
 import android.os.Bundle;
+import android.os.Build;
 import android.os.SystemClock;
+import android.view.ActionMode;
+import android.view.Menu;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
@@ -32,6 +35,9 @@ public final class SelectionMenuModule extends XposedModule {
     private static SystemMenuClassifier menuClassifier;
     private static long nextClassifierAttemptAt;
     private static boolean reportedClassifierInitializationFailure;
+    private static volatile boolean appTextHookInstalled;
+    private static volatile int cachedBuiltinMask;
+    private static volatile long builtinNextRefreshAt;
 
     @Override
     public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
@@ -42,6 +48,15 @@ public final class SelectionMenuModule extends XposedModule {
 
     @Override
     public void onSystemServerStarting(XposedModuleInterface.SystemServerStartingParam param) {
+        if (isXiaomiRom()) {
+            try {
+                installHyperOsQueryHook(param.getClassLoader());
+                return;
+            } catch (Throwable error) {
+                log(android.util.Log.WARN, "SelectionMenuControl",
+                        "HyperOS PM hook unavailable; trying public query boundary", error);
+            }
+        }
         try {
             ClassLoader classLoader = param.getClassLoader();
             Class<?> packageManager = Class.forName(
@@ -55,6 +70,135 @@ public final class SelectionMenuModule extends XposedModule {
             log(android.util.Log.INFO, "SelectionMenuControl", "Hooked public PROCESS_TEXT queryIntentActivities boundary");
         } catch (Throwable error) {
             log(android.util.Log.ERROR, "SelectionMenuControl", "Public PROCESS_TEXT menu query hook not installed", error);
+        }
+    }
+
+    private static boolean isXiaomiRom() {
+        String maker = Build.MANUFACTURER;
+        return maker != null && (maker.equalsIgnoreCase("Xiaomi")
+                || maker.equalsIgnoreCase("Redmi") || maker.equalsIgnoreCase("POCO"));
+    }
+
+    private void installHyperOsQueryHook(ClassLoader loader) throws ReflectiveOperationException {
+        Class<?> engine = Class.forName("com.android.server.pm.ComputerEngine", false, loader);
+        Method query = engine.getDeclaredMethod("queryIntentActivitiesInternal",
+                Intent.class, String.class, long.class, long.class,
+                int.class, int.class, int.class, boolean.class, boolean.class);
+        hook(query).intercept(this::interceptHyperOsQuery);
+        log(android.util.Log.INFO, "SelectionMenuControl",
+                "HyperOS PROCESS_TEXT ComputerEngine hook installed");
+    }
+
+    private Object interceptHyperOsQuery(XposedInterface.Chain chain) throws Throwable {
+        Object result = chain.proceed();
+        List<Object> args = chain.getArgs();
+        if (args.size() != 9 || !(args.get(0) instanceof Intent)
+                || !(result instanceof List<?>)) return result;
+        Intent intent = (Intent) args.get(0);
+        if (!Intent.ACTION_PROCESS_TEXT.equals(intent.getAction())
+                || intent.getComponent() != null || intent.getPackage() != null
+                || Boolean.TRUE.equals(args.get(7))) return result;
+
+        boolean originalQuery = isOriginalQuery(intent);
+        SystemRuleStore.Snapshot rules = readRules();
+        if (!originalQuery && (!rules.valid ||
+                (rules.hiddenComponents.isEmpty() && rules.orderedComponents.isEmpty()))) {
+            respondToProbe();
+            return result;
+        }
+        try {
+            List<ResolveInfo> original = new ArrayList<>(((List<?>) result).size());
+            for (Object entry : (List<?>) result) {
+                if (!(entry instanceof ResolveInfo)) return result;
+                original.add((ResolveInfo) entry);
+            }
+            Map<ResolveInfo, Integer> classifications = new IdentityHashMap<>();
+            if (originalQuery || !rules.orderedComponents.isEmpty()) {
+                classifications = HyperOsMenuClassifier.evaluate(original).classifications;
+            }
+            if (originalQuery) {
+                List<ResolveInfo> annotated = new ArrayList<>(original.size());
+                for (ResolveInfo info : original) {
+                    ResolveInfo copy = new ResolveInfo(info);
+                    if (info.activityInfo != null) {
+                        copy.activityInfo = new ActivityInfo(info.activityInfo);
+                        copy.activityInfo.metaData = info.activityInfo.metaData == null
+                                ? new Bundle() : new Bundle(info.activityInfo.metaData);
+                        copy.activityInfo.metaData.putInt(SystemRuleStore.MENU_CLASSIFICATION_KEY,
+                                classifications.getOrDefault(info, SystemMenuClassifier.UNKNOWN));
+                    }
+                    annotated.add(copy);
+                }
+                respondToProbe();
+                return annotated;
+            }
+            Map<ResolveInfo, Integer> finalClassifications = classifications;
+            List<ResolveInfo> filtered = rules.apply(original,
+                    SelectionMenuModule::componentOf,
+                    entry -> finalClassifications.getOrDefault(entry,
+                            SystemMenuClassifier.UNKNOWN) != SystemMenuClassifier.ORDINARY);
+            respondToProbe();
+            return filtered.equals(original) ? result : filtered;
+        } catch (Throwable error) {
+            log(android.util.Log.WARN, "SelectionMenuControl",
+                    "HyperOS PROCESS_TEXT query failed; stock result preserved", error);
+            return result;
+        }
+    }
+
+    @Override
+    public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
+        if (!isXiaomiRom() || !param.isFirstPackage()
+                || BuildConfig.APPLICATION_ID.equals(param.getPackageName())
+                || appTextHookInstalled) return;
+        try {
+            Class<?> callback = Class.forName("android.widget.Editor$TextActionModeCallback",
+                    false, param.getDefaultClassLoader());
+            Method create = callback.getDeclaredMethod("onCreateActionMode", ActionMode.class, Menu.class);
+            Method prepare = callback.getDeclaredMethod("onPrepareActionMode", ActionMode.class, Menu.class);
+            hook(create).intercept(chain -> interceptTextMenu(chain, true));
+            hook(prepare).intercept(chain -> interceptTextMenu(chain, false));
+            appTextHookInstalled = true;
+            log(android.util.Log.INFO, "SelectionMenuControl",
+                    "HyperOS built-in TextView menu hooks active in " + param.getPackageName());
+        } catch (Throwable error) {
+            log(android.util.Log.WARN, "SelectionMenuControl",
+                    "HyperOS app menu hook unavailable in " + param.getPackageName(), error);
+        }
+    }
+
+    private Object interceptTextMenu(XposedInterface.Chain chain, boolean creating) throws Throwable {
+        Object result = chain.proceed();
+        if (creating && Boolean.FALSE.equals(result)) return result;
+        try {
+            List<Object> arguments = chain.getArgs();
+            if (arguments.size() < 2 || !(arguments.get(1) instanceof Menu)) return result;
+            int mask = readBuiltinMask();
+            if (mask == 0) return result;
+            boolean changed = BuiltinMenuRules.hide((Menu) arguments.get(1), mask);
+            if (changed && !creating) return true;
+        } catch (Throwable error) {
+            log(android.util.Log.WARN, "SelectionMenuControl", "Built-in menu hide failed", error);
+        }
+        return result;
+    }
+
+    private static int readBuiltinMask() {
+        long now = SystemClock.elapsedRealtime();
+        if (now < builtinNextRefreshAt) return cachedBuiltinMask;
+        synchronized (SelectionMenuModule.class) {
+            if (now < builtinNextRefreshAt) return cachedBuiltinMask;
+            try {
+                Class<?> thread = Class.forName("android.app.ActivityThread");
+                Object application = thread.getMethod("currentApplication").invoke(null);
+                if (application instanceof Context) {
+                    cachedBuiltinMask = BuiltinRuleStore.read((Context) application);
+                }
+            } catch (Throwable ignored) {
+                // Keep the default of no hidden actions when settings are unavailable.
+            }
+            builtinNextRefreshAt = now + 2500L;
+            return cachedBuiltinMask;
         }
     }
 

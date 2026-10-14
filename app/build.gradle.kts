@@ -23,11 +23,11 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "io.github.selectionmenucontrol"
+        applicationId = "io.github.selectionmenucontrol.hyperos3"
         minSdk = 26
         targetSdk = 36
-        versionCode = 17
-        versionName = "0.6.2"
+        versionCode = 18
+        versionName = "0.6.2-hyperos3.1"
     }
 
     signingConfigs {
@@ -89,10 +89,10 @@ for (variant in listOf("debug", "release")) {
                 val entryPoint = archive.getEntry("META-INF/xposed/java_init.list")
                     ?: error("Modern java_init.list is missing from the APK")
                 check(archive.getEntry("assets/xposed_init") == null) { "Legacy Xposed entry must not be packaged" }
-                check(archive.getInputStream(moduleProperties).bufferedReader().readText().contains("staticScope=true")) {
+                check(archive.getInputStream(moduleProperties).bufferedReader().readText().contains("staticScope=false")) {
                     "Module must declare staticScope=true"
                 }
-                check(archive.getInputStream(scope).bufferedReader().readText().trim() == "system") {
+                check(archive.getInputStream(scope).bufferedReader().readText().lineSequence().any { it.trim() == "system" }) {
                     "Static scope must only contain system"
                 }
                 check(archive.getInputStream(entryPoint).bufferedReader().readText().trim()

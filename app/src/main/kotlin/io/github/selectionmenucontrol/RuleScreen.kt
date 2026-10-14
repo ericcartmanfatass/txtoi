@@ -123,7 +123,7 @@ private data class RuleDragCallbacks(
 private enum class RestoreAction { HIDDEN, ORDER }
 
 @Composable
-internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
+internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit, onBuiltin: () -> Unit) {
     val editor = remember(activity) { ViewModelProvider(activity)[RuleEditorViewModel::class.java] }
     val saveState by editor.state.collectAsState()
     val emptySnapshot = remember { SystemRuleStore.Snapshot.empty() }
@@ -337,11 +337,12 @@ internal fun RuleScreen(activity: MainActivity, onAbout: () -> Unit) {
         Column(modifier = Modifier.fillMaxWidth().padding(start = 24.dp, end = 16.dp, top = 12.dp, bottom = 16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("文本选择菜单", fontSize = 26.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                TextButton(text = "系统操作", onClick = onBuiltin, enabled = canUseActions)
                 IconButton(onClick = onAbout, enabled = canUseActions) {
                     Image(painterResource(R.drawable.ic_info), "关于", modifier = Modifier.size(24.dp))
                 }
             }
-            Text("勾选隐藏 · 拖动排序 · 自动保存", modifier = Modifier.padding(top = 4.dp),
+            Text("扩展项：勾选隐藏 · 拖动排序 · 自动保存", modifier = Modifier.padding(top = 4.dp),
                 fontSize = 13.sp, color = MiuixTheme.colorScheme.onBackgroundVariant)
             if (originalProcessors.isNotEmpty()) {
                 Text(
